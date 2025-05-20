@@ -1,4 +1,4 @@
 (executables
  (public_names ecnets ptnets)
  (names ec_nets pt_nets)
- (libraries ecnets))
+ (libraries petrinets))

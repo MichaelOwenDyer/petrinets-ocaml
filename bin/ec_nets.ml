@@ -1,82 +1,168 @@
-type place = int
-type transition = int
-type label = int
-type marking_function = place -> bool  (* marking function, true if place has a token *)
-type flow = PT of place * transition | TP of transition * place  (* flow from place to transition or from transition to place *)
+type place = Place of int
+type transition = Transition of int
+type flow = Input of place * transition | Output of transition * place
+type marking = place -> bool
 
-let f p t = PT (p, t)
-let f' t p = TP (t, p)
+type ec_net = {
+  places: place list;
+  transitions: transition list;
+  flows: flow list;
+  initial_marking: marking;
+}
 
-let take (mf: marking_function) (p: place): marking_function =  (* Take a token from place. Assumes place had a token before. *)
-  fun place -> if place = p then false else mf place
+let put_token (current_marking: marking) (p: place): marking =
+  fun place -> if place = p then true else current_marking place
 
-let put (mf: marking_function) (p: place): marking_function =  (* Put a token in place. Assumes place was empty before. *)
-  fun place -> if place = p then true else mf place
+let take_token (current_marking: marking) (p: place): marking =
+  fun place -> if place = p then false else current_marking place
 
-let inputs (t: transition) (flows: flow list): place list = 
-  List.fold_right (function PT (p, t') when t = t' -> fun acc -> p :: acc | _ -> fun acc -> acc) flows []  (* input places of transition t in flow list f *)
+let input_places (t: transition) (flows: flow list): place list =
+  (* Go through each flow and if we find a flow which is an input to t, add it into acc *)
+  List.fold_left (
+    fun place_accumulator flow ->
+      match flow with
+      | Input (p, t') when t = t' -> p :: place_accumulator
+      | _ -> place_accumulator
+  ) [] flows
+  |> List.sort_uniq compare
 
-let outputs (t: transition) (flows: flow list): place list = 
-  List.fold_right (function TP (t', p) when t = t' -> fun acc -> p :: acc | _ -> fun acc -> acc) flows []  (* output places of transition t in flow list f *)
+let output_places (t: transition) (flows: flow list): place list =
+  List.fold_left (
+    fun place_accumulator flow ->
+      match flow with
+      | Output (t', p) when t = t' -> p :: place_accumulator
+      | _ -> place_accumulator
+  ) [] flows
+  |> List.sort_uniq compare
 
-let discover_next_markings (ts: (transition * place list * place list) list) (mf: marking_function): (transition * marking_function) list =  (* Attempt to fire all transitions, return the ones which succeeded along with the resulting markings *)
-  let rec try_fire t mf inputs outputs = match inputs with
-    | [] -> begin match outputs with
-      | [] -> Some (t, mf)
-      | output_place :: outputs -> if mf output_place then None else try_fire t (put mf output_place) [] outputs
+let fire_transition (t: transition) (flows: flow list) (marking: marking): marking option =
+  (* Consume tokens from inputs and calculate resulting marking if possible, otherwise return None *)
+  let inputs = input_places t flows in
+  let marking_with_inputs_consumed =
+    List.fold_left 
+      (fun optional_marking input -> Option.bind optional_marking (fun marking -> if marking input then Some (take_token marking input) else None))
+      (Some marking)
+      inputs
+  in
+  (* Produce tokens on outputs and calculate resulting marking if possible, otherwise return None *)
+  let outputs = output_places t flows in
+  let marking_with_outputs_produced =
+    List.fold_left
+      (fun optional_marking output -> Option.bind optional_marking (fun marking -> if marking output then None else Some (put_token marking output)))
+      marking_with_inputs_consumed
+      outputs
+  in
+  marking_with_outputs_produced
+
+type unexplored_branch = transition * marking
+type marking_label = M of int
+type row = marking_label * marking * (transition * marking_label) list
+type incomplete_row = row * unexplored_branch list
+
+let try_fire_transitions transitions flows marking: unexplored_branch list =
+  (* For each transition in the net, try to fire it. 
+  If it succeeds, add the new marking to the list along with the transition that fired it *)
+  List.fold_left (fun (acc: unexplored_branch list) transition ->
+    match fire_transition transition flows marking with
+    | Some new_marking -> (transition, new_marking) :: acc
+    | None -> acc
+  ) [] transitions
+  |> List.rev
+
+let reachability_analysis net =
+  let first_row: row = (M 0, net.initial_marking, []) in
+  let first_branches: unexplored_branch list = try_fire_transitions net.transitions net.flows net.initial_marking in
+  let start_queue: incomplete_row list = [(first_row, first_branches)] in
+  let rec explore_branches (queue: incomplete_row list) (finished_rows: row list) = match queue with
+    (* No unfinished rows left in the queue, return finished_rows *)
+    | [] -> finished_rows
+
+    (* We have explored all the branches for this row, move the row to finished_rows *)
+    | (row, []) :: remaining_queue -> 
+      let (marking_label, marking, continuations) = row in
+      (* Reverse the continuations because we have been appending to the front of the list *)
+      let finished_row = (marking_label, marking, List.rev continuations) in
+      let finished_rows = (finished_row :: finished_rows) in
+      explore_branches remaining_queue finished_rows
+
+    (* The next row in the queue has at least one unexplored branch *)
+    | ((marking_label, marking, continuations), (enabled_transition, result_marking) :: unexplored_branches) :: remaining_queue -> begin
+      (* Investigate whether we have seen this marking before, return its label otherwise return None *)
+      let existing_label =
+        (* Two markings are equal if they return the same thing for every place *)
+        let eq m1 m2 = List.for_all (fun place -> m1 place = m2 place) net.places in
+        (* First look through the finished rows for the marking *)
+        match List.find_opt (fun (_, seen_marking, _) -> eq result_marking seen_marking) finished_rows with
+          | Some (seen_label, _, _) -> Some seen_label
+          (* Then look through the incomplete rows *)
+          | None -> match List.find_opt (fun ((_, seen_marking, _), _) -> eq result_marking seen_marking) queue with 
+            | Some ((seen_label, _, _), _) -> Some seen_label
+            | None -> None
+
+      (* Now decide what to do depending on whether we have seen the marking before *)
+      in match existing_label with
+        | Some existing_label ->
+          (* This marking already has a label, just add a continuation and don't explore the branch further *)
+          let current_row = ((marking_label, marking, (enabled_transition, existing_label) :: continuations), unexplored_branches) in
+          let queue = current_row :: remaining_queue in
+          explore_branches queue finished_rows
+
+        | None ->
+          (* We have not seen this marking before, create a new label, note it down in this row, and create a new incomplete row for it *)
+          let new_label = M (List.length finished_rows + List.length queue) in
+          (* The row for the source marking gets an additional continuation *)
+          let current_row = ((marking_label, marking, (enabled_transition, new_label) :: continuations), unexplored_branches) in
+          (* The new row is for the newly discovered marking *)
+          let new_row = ((new_label, result_marking, []), try_fire_transitions net.transitions net.flows result_marking) in
+          (* Continue with the new row and the rest of the rows *)
+          let queue = new_row :: current_row :: remaining_queue in
+          explore_branches queue finished_rows
     end
-    | input_place :: inputs -> if mf input_place then try_fire t (take mf input_place) inputs outputs else None
-  in
-  List.filter_map (fun (t, inputs, outputs) -> try_fire t mf inputs outputs) ts
+  in explore_branches start_queue []
+  |> List.sort (fun (M x, _, _) (M y, _, _) -> compare x y)
 
-let places_of_flows (flows: flow list): place list = List.sort_uniq compare (
-  List.map (fun f -> match f with PT (p, _) -> p | TP (_, p) -> p) flows
-)  (* places of flow list f *)
-
-let transitions_of_flows (flows: flow list): transition list = List.sort_uniq compare (
-  List.map (fun f -> match f with PT (_, t) -> t | TP (t, _) -> t) flows
-)  (* transitions of flow list f *)
-
-let reachability_analysis (flows: flow list) (m0: marking_function): (label * marking_function * (transition * label) list) list =
-  let places = places_of_flows flows in  (* places in the Petri net *)
-  let eq m1 m2 = List.for_all (fun p -> m1 p = m2 p) places in  (* equality of markings *)
-  let transitions = List.map (fun t -> (t, inputs t flows, outputs t flows)) (transitions_of_flows flows) in  (* input and output places of transitions *)
-  let rec explore in_progress finished = match in_progress with  (* further explore the reachability graph *)
-    | [] -> finished  (* no more rows to explore, we are done *)
-    | ((label, marking, mappings), []) :: rest_in_progress -> explore rest_in_progress ((label, marking, List.rev mappings) :: finished)  (* no more outgoing transitions to explore from this marking, move to finished *)
-    | ((label, marking, mappings), (transition, successor_marking) :: rest_to_explore) :: rest_in_progress ->  (* explore the next outgoing transition from this marking *)
-      let search_for marking = match List.find_opt (fun (_, seen_marking, _) -> eq seen_marking marking) finished with
-        | Some (seen_label, _, _) -> Some seen_label
-        | None -> match List.find_opt (fun ((_, seen_marking, _), _) -> eq seen_marking marking) in_progress with
-          | Some ((seen_label, _, _), _) -> Some seen_label
-          | None -> None in
-      match search_for successor_marking with  (* check if we have seen this marking before *)
-      | Some seen_label -> begin  (* This marking already has a label, just add a mapping and don't explore the branch further *)
-        let new_mappings = (transition, seen_label) :: mappings in (* The new mapping is from the source marking, over the transition, to the already seen marking *)
-        let current_row = ((label, marking, new_mappings), rest_to_explore) in  (* The row for the source marking gets an additional mapping *)
-        explore (current_row :: rest_in_progress) finished  (* Continue with the rest of the rows *)
-      end
-      | None -> begin  (* We have not seen this marking before, need to add a new label *)
-        let new_label = List.length finished + List.length in_progress in (* New label = the number of rows so far *)
-        let new_row = ((new_label, successor_marking, []), discover_next_markings transitions successor_marking) in (* The new row is for the newly discovered marking *)
-        let current_row = ((label, marking, (transition, new_label) :: mappings), rest_to_explore) in (* The row for the source marking gets an additional mapping *)
-        explore (new_row :: current_row :: rest_in_progress) finished  (* Continue with the new row and the rest of the rows *)
-      end
-  in
-  explore [((0, m0, []), discover_next_markings transitions m0)] []  (* Start the exploration with the initial marking and the transitions it enables *)
-
-let print_reachability_graph (flows: flow list) (mf: marking_function): unit =
-  let places = places_of_flows flows in
-  let reachability_graph = reachability_analysis flows mf in
-  let string_of_list string_of_elem l =
-    "| " ^ (String.concat " | " (List.map string_of_elem l)) ^ " |" in
-  let string_of_place p = "P" ^ string_of_int p in
-  let string_of_transition t = "T" ^ string_of_int t in
-  let string_of_label l = "M" ^ string_of_int l in
-  print_endline ("   " ^ string_of_list string_of_place places ^ " Firing Transitions");
-  let string_of_marking mf = string_of_list (fun p -> if mf p then "X " else "  ") places in
+let print_reachability_graph (net: ec_net): unit =
+  let reachability_graph = reachability_analysis net in
+  let string_of_list string_of_elem l = "| " ^ (String.concat " | " (List.map string_of_elem l)) ^ " |" in
+  let string_of_place (Place p) = " P" ^ string_of_int p in
+  let string_of_transition (Transition t) = "T" ^ string_of_int t in
+  let string_of_label (M l) = "M" ^ string_of_int l in
+  let string_of_marking mf = string_of_list (fun p -> if mf p then " X " else "   ") net.places in
   let string_of_mappings mappings = if mappings = [] then "deadlock" else String.concat ", " (List.map (fun (t, l) -> string_of_transition t ^ " -> " ^ string_of_label l) mappings) in
   let string_of_row (label, marking, mappings) = string_of_label label ^ " " ^ string_of_marking marking ^ " " ^ string_of_mappings mappings in
+
+  print_endline ("   " ^ string_of_list string_of_place net.places ^ " Firing Transitions");
   List.iter (fun row -> print_endline (string_of_row row)) reachability_graph
 
-let m0 = fun p -> p = 1
+let net (flows: flow list) (initial_marking: int list) =
+  let (places, transitions) = List.fold_left (fun (places, transitions) flow -> match flow with
+    | Input (p, t) -> (p :: places, t :: transitions)
+    | Output (t, p) -> (p :: places, t :: transitions)
+  ) ([], []) flows in
+  let places = List.sort_uniq compare places in
+  let transitions = List.sort_uniq compare transitions in
+  let initial_marking = fun (Place p) -> List.mem p initial_marking in
+  {
+    places = places;
+    transitions = transitions;
+    flows = flows;
+    initial_marking = initial_marking;
+  }
+
+let example_net = {
+  places = [Place 1; Place 2; Place 3; Place 4; Place 5];
+  transitions = [Transition 1; Transition 2; Transition 3; Transition 4];
+  flows = [
+    Input (Place 1, Transition 1);
+    Output (Transition 1, Place 3);
+    Input (Place 2, Transition 2);
+    Input (Place 2, Transition 4);
+    Output (Transition 2, Place 4);
+    Output (Transition 1, Place 5);
+    Input (Place 3, Transition 3);
+    Input (Place 4, Transition 3);
+    Output (Transition 3, Place 1);
+    Output (Transition 3, Place 2);
+  ];
+  initial_marking = fun p -> match p with Place 1 -> true | Place 2 -> true | _ -> false;
+}
